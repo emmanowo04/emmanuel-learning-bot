@@ -347,20 +347,29 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     message_text = update.message.text
     
+    logger.info(f"Text input from {user_id}: {message_text}")
+    logger.info(f"User data: {context.user_data}")
+    
     # Check what action the user is doing
     planning_type = context.user_data.get('planning')
     reflection_phase = context.user_data.get('reflection_phase')
     
+    logger.info(f"Planning type: {planning_type}, Reflection phase: {reflection_phase}")
+    
     # If user is planning Bible or Sound Desk
     if planning_type == 'bible':
+        logger.info("Processing Bible plan input")
         await handle_bible_plan_input(update, context)
     elif planning_type == 'sound_desk':
+        logger.info("Processing Sound Desk plan input")
         await handle_sound_plan_input(update, context)
     # If user is reflecting
     elif reflection_phase:
+        logger.info("Processing reflection input")
         await handle_reflection_input(update, context)
     else:
         # Default: treat as reflection or just acknowledge
+        logger.info("No planning/reflection context, sending default message")
         await update.message.reply_text(
             "👋 I didn't catch that. Please use the menu to:\n"
             "• Plan your week\n"
