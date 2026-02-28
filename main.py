@@ -342,6 +342,35 @@ async def reflect_free(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return WAITING_FOR_REFLECTION_CONTENT
 
 
+async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Route text input to appropriate handler based on context"""
+    user_id = update.effective_user.id
+    message_text = update.message.text
+    
+    # Check what action the user is doing
+    planning_type = context.user_data.get('planning')
+    reflection_phase = context.user_data.get('reflection_phase')
+    
+    # If user is planning Bible or Sound Desk
+    if planning_type == 'bible':
+        await handle_bible_plan_input(update, context)
+    elif planning_type == 'sound_desk':
+        await handle_sound_plan_input(update, context)
+    # If user is reflecting
+    elif reflection_phase:
+        await handle_reflection_input(update, context)
+    else:
+        # Default: treat as reflection or just acknowledge
+        await update.message.reply_text(
+            "👋 I didn't catch that. Please use the menu to:\n"
+            "• Plan your week\n"
+            "• Log learning\n"
+            "• View progress\n\n"
+            "Use /start to see the menu.",
+            parse_mode='Markdown'
+        )
+
+
 async def handle_reflection_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle reflection text input"""
     user_id = update.effective_user.id
@@ -821,7 +850,7 @@ def main():
     
     # Text message handlers (for plan inputs and reflections)
     application.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_reflection_input)
+        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input)
     )
     
     # Start bot
