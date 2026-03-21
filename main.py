@@ -343,40 +343,38 @@ async def reflect_free(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Route text input to appropriate handler based on context"""
+    """
+    Route text input to the correct handler based on the user's current mode.
+
+    Checks context.user_data for:
+      - 'planning' == 'bible'      -> save as Bible plan
+      - 'planning' == 'sound_desk' -> save as Sound Desk plan
+      - 'reflection_phase'         -> save as reflection entry
+      - otherwise                  -> show a simple prompt to use the menu
+    """
     user_id = update.effective_user.id
-    message_text = update.message.text
-    
-    logger.info(f"Text input from {user_id}: {message_text}")
-    logger.info(f"User data: {context.user_data}")
-    
-    # Check what action the user is doing
-    planning_type = context.user_data.get('planning')
+    planning_mode = context.user_data.get('planning')
     reflection_phase = context.user_data.get('reflection_phase')
-    
-    logger.info(f"Planning type: {planning_type}, Reflection phase: {reflection_phase}")
-    
-    # If user is planning Bible or Sound Desk
-    if planning_type == 'bible':
-        logger.info("Processing Bible plan input")
+
+    logger.info(
+        f"handle_text_input | user={user_id} | "
+        f"planning={planning_mode!r} | reflection={reflection_phase!r} | "
+        f"text={update.message.text[:60]!r}"
+    )
+
+    if planning_mode == 'bible':
         await handle_bible_plan_input(update, context)
-    elif planning_type == 'sound_desk':
-        logger.info("Processing Sound Desk plan input")
+
+    elif planning_mode == 'sound_desk':
         await handle_sound_plan_input(update, context)
-    # If user is reflecting
+
     elif reflection_phase:
-        logger.info("Processing reflection input")
         await handle_reflection_input(update, context)
+
     else:
-        # Default: treat as reflection or just acknowledge
-        logger.info("No planning/reflection context, sending default message")
         await update.message.reply_text(
-            "👋 I didn't catch that. Please use the menu to:\n"
-            "• Plan your week\n"
-            "• Log learning\n"
-            "• View progress\n\n"
-            "Use /start to see the menu.",
-            parse_mode='Markdown'
+            "👋 Not sure what you meant — use the menu to get started!\n\n"
+            "Type /start to see your options."
         )
 
 
@@ -386,7 +384,10 @@ async def handle_reflection_input(update: Update, context: ContextTypes.DEFAULT_
     reflection_text = update.message.text
     reflection_phase = context.user_data.get('reflection_phase', 'free')
     learning_type = context.user_data.get('learning_type', 'general')
-    
+
+    # Clear reflection state so future messages don't keep routing here
+    context.user_data.pop('reflection_phase', None)
+
     # Format reflection entry
     formatted_reflection = (
         f"**{learning_type.upper()} Learning - {reflection_phase.upper()} Phase**\n\n"
@@ -622,7 +623,10 @@ async def handle_bible_plan_input(update: Update, context: ContextTypes.DEFAULT_
     """Handle Bible plan input"""
     user_id = update.effective_user.id
     plan_text = update.message.text
-    
+
+    # Clear planning state so future messages don't keep routing here
+    context.user_data.pop('planning', None)
+
     data = load_user_data(user_id)
     data['current_bible_plan'] = plan_text.split('\n')
     user_data[user_id] = data
@@ -685,7 +689,10 @@ async def handle_sound_plan_input(update: Update, context: ContextTypes.DEFAULT_
     """Handle sound desk plan input"""
     user_id = update.effective_user.id
     plan_text = update.message.text
-    
+
+    # Clear planning state so future messages don't keep routing here
+    context.user_data.pop('planning', None)
+
     data = load_user_data(user_id)
     data['current_sound_concepts'] = plan_text.split('\n')
     user_data[user_id] = data
