@@ -49,6 +49,12 @@ MORNING_DIGEST_MINUTE = 30
 PLANNER_CHECK_INTERVAL_SECONDS = 300  # how often to look for upcoming blocks
 PLANNER_ALERT_LOOKAHEAD_MINUTES = 5   # alert this many minutes before a block starts
 
+# ---- Mannymaxx (tasks + schedule) integration — same Supabase project, mm_ prefixed tables ----
+MANNYMAXX_MORNING_HOUR = 6
+MANNYMAXX_MORNING_MINUTE = 45
+MANNYMAXX_EVENING_HOUR = 20
+MANNYMAXX_EVENING_MINUTE = 0
+
 # Conversation states
 WAITING_FOR_BIBLE_PASSAGE = 1
 WAITING_FOR_SOUND_CONCEPT = 2
@@ -977,6 +983,118 @@ async def check_upcoming_blocks(context: ContextTypes.DEFAULT_TYPE):
                 logger.error(f"Error sending planner alert: {e}")
 
 
+# ==================== MANNYMAXX (tasks + schedule) DAILY REFLECTION ====================
+# Reads from the same Supabase project's mm_ tables (Mannymaxx's task list and
+# schedule). Morning: what's planned today. Evening: what got done vs what didn't,
+# to support the morning/evening reflection habit.
+
+def fetch_mannymaxx_today_schedule():
+    """Today's mm_planner_items, ordered by slot. Empty list if none / no Supabase."""
+    if not supabase:
+        return []
+    today_str = datetime.now(USER_TIMEZONE).strftime('%Y-%m-%d')
+    try:
+        res = (
+            supabase.table('mm_planner_items')
+            .select('*')
+            .eq('block_date', today_str)
+            .order('slot_index')
+            .execute()
+        )
+        return res.data or []
+    except Exception as e:
+        logger.error(f"Error fetching Mannymaxx schedule: {e}")
+        return []
+
+
+def fetch_mannymaxx_task_status(task_ids):
+    """Given task ids, return {id: {'title':..., 'is_complete':...}}."""
+    if not supabase or not task_ids:
+        return {}
+    try:
+        res = supabase.table('mm_tasks').select('id,title,is_complete').in_('id', task_ids).execute()
+        return {row['id']: row for row in (res.data or [])}
+    except Exception as e:
+        logger.error(f"Error fetching Mannymaxx task status: {e}")
+        return {}
+
+
+async def send_mannymaxx_morning_digest(context: ContextTypes.DEFAULT_TYPE):
+    """Sends today's Mannymaxx schedule once each morning."""
+    chat_id = get_planner_chat_id()
+    if not chat_id:
+        return
+
+    items = fetch_mannymaxx_today_schedule()
+    if not items:
+        message = (
+            "📋 **Mannymaxx — today's plan**\n\n"
+            "Nothing scheduled yet — open the Schedule tab to lay out your day."
+        )
+    else:
+        seen = set()
+        lines = []
+        for it in items:
+            key = (it['slot_index'], it['activity'])
+            if key in seen:
+                continue
+            seen.add(key)
+            lines.append(f"• {_slot_label(it['slot_index'])} — {it['activity']}")
+        message = (
+            "📋 **Mannymaxx — today's plan**\n\n" + "\n".join(lines) +
+            "\n\n_Morning reflection: why are these on today's list, and what actually matters most?_"
+        )
+
+    try:
+        await context.bot.send_message(chat_id=chat_id, text=message, parse_mode='Markdown')
+    except Exception as e:
+        logger.error(f"Error sending Mannymaxx morning digest: {e}")
+
+
+async def send_mannymaxx_evening_digest(context: ContextTypes.DEFAULT_TYPE):
+    """Sends a completed-vs-outstanding summary each evening."""
+    chat_id = get_planner_chat_id()
+    if not chat_id:
+        return
+
+    items = fetch_mannymaxx_today_schedule()
+    if not items:
+        message = "🌙 **Evening reflection**\n\nNothing was scheduled today."
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=message, parse_mode='Markdown')
+        except Exception as e:
+            logger.error(f"Error sending Mannymaxx evening digest: {e}")
+        return
+
+    task_ids = list({it['task_id'] for it in items if it.get('task_id')})
+    task_map = fetch_mannymaxx_task_status(task_ids)
+
+    done_lines, todo_lines, seen = [], [], set()
+    for it in items:
+        tid = it.get('task_id')
+        key = (tid, it['activity'])
+        if key in seen:
+            continue
+        seen.add(key)
+        if tid and tid in task_map:
+            (done_lines if task_map[tid]['is_complete'] else todo_lines).append(f"• {it['activity']}")
+
+    parts = ["🌙 **Evening reflection**"]
+    if done_lines:
+        parts.append("✅ **Completed:**\n" + "\n".join(done_lines))
+    if todo_lines:
+        parts.append("⏳ **Still to do:**\n" + "\n".join(todo_lines) + "\n\n_Worth moving these to tomorrow if they still matter._")
+    if not done_lines and not todo_lines:
+        parts.append("Today's schedule was freeform activities with no linked tasks to check off.")
+    parts.append("_What got in the way today, if anything? What made today good?_")
+    message = "\n\n".join(parts)
+
+    try:
+        await context.bot.send_message(chat_id=chat_id, text=message, parse_mode='Markdown')
+    except Exception as e:
+        logger.error(f"Error sending Mannymaxx evening digest: {e}")
+
+
 # ==================== MAIN APPLICATION ====================
 
 def main():
@@ -1039,6 +1157,16 @@ def main():
             interval=PLANNER_CHECK_INTERVAL_SECONDS,
             first=10,
             name="planner_block_check",
+        )
+        application.job_queue.run_daily(
+            send_mannymaxx_morning_digest,
+            time=dtime(MANNYMAXX_MORNING_HOUR, MANNYMAXX_MORNING_MINUTE, tzinfo=USER_TIMEZONE),
+            name="mannymaxx_morning_digest",
+        )
+        application.job_queue.run_daily(
+            send_mannymaxx_evening_digest,
+            time=dtime(MANNYMAXX_EVENING_HOUR, MANNYMAXX_EVENING_MINUTE, tzinfo=USER_TIMEZONE),
+            name="mannymaxx_evening_digest",
         )
     else:
         logger.warning("SUPABASE_URL/SUPABASE_KEY not set — planner alerts are disabled.")
