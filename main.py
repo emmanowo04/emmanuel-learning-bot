@@ -1,11 +1,12 @@
 import os
 import json
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dtime
 from typing import Dict, Optional
 import pytz
 from dotenv import load_dotenv
 import requests
+from supabase import create_client, Client
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -35,6 +36,18 @@ REFLECTLY_API_KEY = os.getenv('REFLECTLY_API_KEY')  # Optional - for future inte
 USER_TIMEZONE = pytz.timezone('Europe/London')
 DAILY_REMINDER_HOUR = 7  # 7 AM
 DAILY_REMINDER_MINUTE = 0
+
+# ---- Planner alerts (health-dashboard integration) ----
+SUPABASE_URL = os.getenv('SUPABASE_URL')
+SUPABASE_KEY = os.getenv('SUPABASE_KEY')  # same anon key the React app uses
+supabase: Optional[Client] = (
+    create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
+)
+
+MORNING_DIGEST_HOUR = 6
+MORNING_DIGEST_MINUTE = 30
+PLANNER_CHECK_INTERVAL_SECONDS = 300  # how often to look for upcoming blocks
+PLANNER_ALERT_LOOKAHEAD_MINUTES = 5   # alert this many minutes before a block starts
 
 # Conversation states
 WAITING_FOR_BIBLE_PASSAGE = 1
@@ -156,7 +169,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start command - initialize bot"""
     user_id = update.effective_user.id
     load_user_data(user_id)
-    
+
+    # Remember this chat so scheduled jobs (Bible reminder, planner alerts) know where to send
+    set_planner_chat_id(update.effective_chat.id)
+    await setup_daily_job(user_id, context.application)
+
     keyboard = [
         [InlineKeyboardButton("📖 Bible Reading", callback_data='bible_main')],
         [InlineKeyboardButton("🎛️ Sound Desk Learning", callback_data='sound_main')],
@@ -811,13 +828,153 @@ async def setup_daily_job(user_id: int, application: Application):
         # Create new job
         application.job_queue.run_daily(
             daily_reminder,
-            time=datetime.time(DAILY_REMINDER_HOUR, DAILY_REMINDER_MINUTE, tzinfo=USER_TIMEZONE),
+            time=dtime(DAILY_REMINDER_HOUR, DAILY_REMINDER_MINUTE, tzinfo=USER_TIMEZONE),
             name=f"daily_{user_id}",
             context=user_id
         )
         logger.info(f"Set up daily job for user {user_id}")
     except Exception as e:
         logger.error(f"Error setting up daily job for {user_id}: {e}")
+
+
+# ==================== PLANNER ALERTS (health-dashboard integration) ====================
+# Reads from the same Supabase project as the health-dashboard React app's
+# `planner_blocks` table. Sends a morning digest of the day's plan, then a
+# heads-up shortly before each 30-minute block starts.
+
+def _slot_label(idx: int) -> str:
+    """slot_index (0-47, 30-min increments from midnight) -> '6:00am' style label"""
+    h, m = divmod(idx * 30, 60)
+    period = 'am' if h < 12 else 'pm'
+    h12 = h % 12 or 12
+    return f"{h12}:{m:02d}{period}"
+
+
+def _slot_datetime(day, idx: int):
+    """slot_index -> tz-aware datetime for that slot on the given date"""
+    h, m = divmod(idx * 30, 60)
+    naive = datetime.combine(day, dtime(h, m))
+    return USER_TIMEZONE.localize(naive)
+
+
+def get_planner_chat_id() -> Optional[int]:
+    """Look up the chat to send planner alerts to (set via /start)."""
+    if not supabase:
+        return None
+    try:
+        res = supabase.table('bot_settings').select('value').eq('key', 'planner_chat_id').execute()
+        if res.data:
+            return int(res.data[0]['value'])
+    except Exception as e:
+        logger.error(f"Error reading planner chat id: {e}")
+    return None
+
+
+def set_planner_chat_id(chat_id: int):
+    """Remember which chat should receive planner alerts."""
+    if not supabase:
+        return
+    try:
+        supabase.table('bot_settings').upsert(
+            {'key': 'planner_chat_id', 'value': str(chat_id)}
+        ).execute()
+    except Exception as e:
+        logger.error(f"Error saving planner chat id: {e}")
+
+
+def fetch_today_blocks():
+    """Today's planner_blocks, ordered by time. Empty list if none / no Supabase."""
+    if not supabase:
+        return []
+    today_str = datetime.now(USER_TIMEZONE).strftime('%Y-%m-%d')
+    try:
+        res = (
+            supabase.table('planner_blocks')
+            .select('*')
+            .eq('block_date', today_str)
+            .order('slot_index')
+            .execute()
+        )
+        return res.data or []
+    except Exception as e:
+        logger.error(f"Error fetching today's planner blocks: {e}")
+        return []
+
+
+def was_alert_sent(date_str: str, slot_index: int) -> bool:
+    if not supabase:
+        return True  # fail safe: don't spam if Supabase is unreachable
+    try:
+        res = (
+            supabase.table('planner_alerts_sent')
+            .select('slot_index')
+            .eq('block_date', date_str)
+            .eq('slot_index', slot_index)
+            .execute()
+        )
+        return bool(res.data)
+    except Exception as e:
+        logger.error(f"Error checking planner alert log: {e}")
+        return True
+
+
+def mark_alert_sent(date_str: str, slot_index: int):
+    if not supabase:
+        return
+    try:
+        supabase.table('planner_alerts_sent').upsert(
+            {'block_date': date_str, 'slot_index': slot_index}
+        ).execute()
+    except Exception as e:
+        logger.error(f"Error logging planner alert: {e}")
+
+
+async def send_morning_digest(context: ContextTypes.DEFAULT_TYPE):
+    """Sends the day's full plan once each morning."""
+    chat_id = get_planner_chat_id()
+    if not chat_id:
+        return
+
+    blocks = fetch_today_blocks()
+    if not blocks:
+        message = (
+            "🌤️ **Morning!**\n\n"
+            "No plan set for today yet — pop into the Planner tab in your "
+            "Health Dashboard to lay it out."
+        )
+    else:
+        lines = [f"• {_slot_label(b['slot_index'])} — {b['activity']}" for b in blocks]
+        message = "🌤️ **Today's plan:**\n\n" + "\n".join(lines)
+
+    try:
+        await context.bot.send_message(chat_id=chat_id, text=message, parse_mode='Markdown')
+    except Exception as e:
+        logger.error(f"Error sending morning digest: {e}")
+
+
+async def check_upcoming_blocks(context: ContextTypes.DEFAULT_TYPE):
+    """Runs every few minutes; alerts shortly before each block starts."""
+    chat_id = get_planner_chat_id()
+    if not chat_id:
+        return
+
+    now = datetime.now(USER_TIMEZONE)
+    today_str = now.strftime('%Y-%m-%d')
+    blocks = fetch_today_blocks()
+
+    for b in blocks:
+        start = _slot_datetime(now.date(), b['slot_index'])
+        seconds_until = (start - now).total_seconds()
+
+        if 0 <= seconds_until <= PLANNER_ALERT_LOOKAHEAD_MINUTES * 60:
+            if was_alert_sent(today_str, b['slot_index']):
+                continue
+            message = f"⏰ Coming up at {_slot_label(b['slot_index'])}: **{b['activity']}**"
+            try:
+                await context.bot.send_message(chat_id=chat_id, text=message, parse_mode='Markdown')
+                mark_alert_sent(today_str, b['slot_index'])
+            except Exception as e:
+                logger.error(f"Error sending planner alert: {e}")
 
 
 # ==================== MAIN APPLICATION ====================
@@ -868,7 +1025,24 @@ def main():
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input)
     )
-    
+
+    # Planner alert jobs (health-dashboard integration) — no per-user setup needed,
+    # they look up the saved chat id from Supabase each time they run
+    if supabase:
+        application.job_queue.run_daily(
+            send_morning_digest,
+            time=dtime(MORNING_DIGEST_HOUR, MORNING_DIGEST_MINUTE, tzinfo=USER_TIMEZONE),
+            name="planner_morning_digest",
+        )
+        application.job_queue.run_repeating(
+            check_upcoming_blocks,
+            interval=PLANNER_CHECK_INTERVAL_SECONDS,
+            first=10,
+            name="planner_block_check",
+        )
+    else:
+        logger.warning("SUPABASE_URL/SUPABASE_KEY not set — planner alerts are disabled.")
+
     # Start bot
     print("🤖 Learning Streak Tracker Bot is starting...")
     application.run_polling()
